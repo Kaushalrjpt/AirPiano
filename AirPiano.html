@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Piano</title>
+<style>
+  :root { --accent: #ff4f9a; --ink: #15111c; --text: #efe9f7; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); }
+
+  #out { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
+  #video { display: none; }
+
+  /* start button: centered until the camera runs */
+  #dock { position: fixed; z-index: 5; display: flex; gap: 8px; align-items: center; }
+  #dock.center { left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  #dock.corner { right: 14px; bottom: 14px; }
+
+  .btn { background: rgba(21,17,28,0.78); color: var(--text); border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 999px; padding: 9px 16px; font: inherit; font-size: 0.9rem; cursor: pointer;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  .btn:hover { background: rgba(40,32,52,0.9); }
+  .btn:focus-visible { outline: 2px solid #4de1d0; outline-offset: 2px; }
+  .btn[disabled] { opacity: .6; cursor: wait; }
+  #dock.center #camBtn { background: var(--accent); color: #1a0b13; font-weight: 700; font-size: 1.05rem; padding: 14px 28px; border: 0; }
+  #camBtn .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #5fe08a; margin-right: 8px; }
+  #camBtn.off .dot { background: #8d8497; }
+  #dock.center #camBtn .dot, #dock.center #gearBtn { display: none; }
+
+  #panel { position: fixed; right: 14px; bottom: 62px; z-index: 6; display: none; flex-direction: column; gap: 10px;
+    background: rgba(21,17,28,0.9); border: 1px solid rgba(255,255,255,0.16); border-radius: 14px; padding: 12px 14px;
+    font-size: 0.85rem; min-width: 200px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  #panel.open { display: flex; }
+  #panel label { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  #panel input[type=range] { accent-color: var(--accent); width: 110px; }
+  #panel select { background: var(--ink); color: var(--text); border: 1px solid #3a3050; border-radius: 6px; padding: 2px 6px; font: inherit; }
+  #panel input[type=checkbox] { accent-color: var(--accent); }
+
+
+  #pianoBadge {
+    position: fixed; z-index: 4; left: 14px; top: 8px;
+    padding: 5px 10px; border-radius: 999px;
+    background: rgba(21,17,28,0.62);
+    border: 1px solid rgba(255,255,255,0.12);
+    font-size: .72rem; letter-spacing: .08em; text-transform: uppercase;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    pointer-events: none;
+  }
+
+  #err { position: fixed; left: 50%; top: 58%; transform: translateX(-50%); color: #ff8aa8; font-size: .9rem; text-align: center; max-width: 80vw; }
+</style>
+</head>
+<body>
+
+<video id="video" playsinline muted></video>
+<canvas id="out"></canvas>
+
+<div id="dock" class="center">
+  <button id="camBtn" class="btn">Start camera</button>
+  <button id="gearBtn" class="btn" aria-label="Settings">Settings</button>
+</div>
+<div id="panel">
+  <label>Volume <input id="vol" type="range" min="0" max="1" step="0.01" value="0.7"></label>
+  <label>Tap sensitivity <input id="sens" type="range" min="1" max="10" step="1" value="6"></label>
+  <label>Keyboard <span style="opacity:.65">88 keys · A0–C8</span></label>
+  <label>Touch to play <input id="touchMode" type="checkbox" checked></label>
+  <label>Hand lines <input id="showHand" type="checkbox" checked></label>
+  <label>Note names <input id="showLabels" type="checkbox" checked></label>
+</div>
+<div id="err"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('out');
+  const ctx = canvas.getContext('2d');
+  const dock = document.getElementById('dock');
+  const camBtn = document.getElementById('camBtn');
+  const gearBtn = document.getElementById('gearBtn');
+  const panel = document.getElementById('panel');
+  const errEl = document.getElementById('err');
+  const volEl = document.getElementById('vol');
+  const sensEl = document.getElementById('sens');
+  const octEl = document.getElementById('oct');
+  const showHandEl = document.getElementById('showHand');
+  const touchEl = document.getElementById('touchMode');
+  const showLabelsEl = document.getElementById('showLabels');
+
+  // ---------- Audio ----------
+  let audio = null, master = null;
+  function initAudio() {
+    if (audio) return;
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+    const comp = audio.createDynamicsCompressor();
+    master = audio.createGain();
+    master.gain.value = parseFloat(volEl.value);
+    master.connect(comp); comp.connect(audio.destination);
+  }
+  volEl.addEventListener('input', () => { if (master) master.gain.value = parseFloat(volEl.value); });
+  const midiToFreq = m => 440 * Math.pow(2, (m - 69) / 12);
+
+  function noteOn(midi, velocity = 0.8) {
+    if (!audio) return null;
+    if (audio.state === 'suspended') audio.resume();
+    const t = audio.currentTime, f = midiToFreq(midi);
+    const out = audio.createGain();
+    out.gain.setValueAtTime(0.0001, t);
+    out.gain.exponentialRampToValueAtTime(Math.max(0.05, velocity) * 0.9, t + 0.006);
+    out.gain.exponentialRampToValueAtTime(Math.max(0.03, velocity) * 0.35, t + 0.35);
+    out.gain.exponentialRampToValueAtTime(0.0001, t + 3.5);
+    out.connect(master);
+    [[1, 'triangle', 1.0], [2, 'sine', 0.45], [3, 'sine', 0.2], [4, 'sine', 0.1]].forEach(([mult, type, amp], i) => {
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.type = type; o.frequency.value = f * mult; o.detune.value = (Math.random() - 0.5) * 4;
+      g.gain.setValueAtTime(amp, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + (i === 0 ? 3.5 : 1.2 / mult + 0.4));
+      o.connect(g); g.connect(out); o.start(t); o.stop(t + 3.6);
+    });
+    return { out };
+  }
+  function noteOff(v) {
+    if (!v || !audio) return;
+    const t = audio.currentTime;
+    v.out.gain.cancelScheduledValues(t);
+    v.out.gain.setValueAtTime(Math.max(v.out.gain.value, 0.0001), t);
+    v.out.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+  }
+
+  // ---------- Full 88-key piano layout ----------
+  // A real piano has 88 keys: 52 white keys + 36 black keys,
+  // spanning A0 (MIDI 21) through C8 (MIDI 108).
+  const FIRST_MIDI = 21;                 // A0
+  const LAST_MIDI = 108;                 // C8
+  const WHITE_SEMIS = [0, 2, 4, 5, 7, 9, 11];
+  const WHITE_NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
+  const BLACK_AFTER = [0, 1, 3, 4, 5];  // C#, D#, F#, G#, A#
+  const WHITE_COUNT = 52;
+  const KB_HEIGHT = 0.22;                // compact top keyboard, like a real piano strip
+  let whites = [], blacks = [];
+  let kb = { top: 0, h: 0, ww: 0 };
+
+  function midiName(midi) {
+    const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+    return names[midi % 12] + (Math.floor(midi / 12) - 1);
+  }
+
+  function layoutKeys() {
+    const W = canvas.width, H = canvas.height;
+    kb.top = Math.round(H * 0.018);
+    kb.h = Math.round(H * KB_HEIGHT);
+    kb.ww = W / WHITE_COUNT;
+    whites = [];
+    blacks = [];
+
+    // Build all 52 white keys from A0 to C8.
+    for (let midi = FIRST_MIDI; midi <= LAST_MIDI; midi++) {
+      if (midi % 12 === 1 || midi % 12 === 3 || midi % 12 === 6 ||
+          midi % 12 === 8 || midi % 12 === 10) continue; // black keys
+      const x = whites.length * kb.ww;
+      whites.push({
+        midi,
+        name: midiName(midi),
+        x, y: kb.top, w: kb.ww, h: kb.h
+      });
+    }
+
+    // Black keys are centered over the appropriate gaps between white keys.
+    for (const w of whites) {
+      const pc = w.midi % 12;
+      if (![0, 2, 5, 7, 9].includes(pc)) continue;
+      const midi = w.midi + 1;
+      if (midi > LAST_MIDI) continue;
+      const bw = Math.max(9, kb.ww * 0.56);
+      blacks.push({
+        midi,
+        name: midiName(midi),
+        x: w.x + w.w - bw / 2,
+        y: kb.top,
+        w: bw,
+        h: kb.h * 0.62
+      });
+    }
+  }
+
+  function keyAt(x, y) {
+    if (x < 0 || x > canvas.width || y < kb.top || y > kb.top + kb.h) return null;
+    // Black keys sit above the white keys, so test them first.
+    for (const b of blacks) {
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
+    }
+    const i = Math.min(WHITE_COUNT - 1, Math.max(0, Math.floor(x / kb.ww)));
+    return whites[i] || null;
+  }
+  // A fingertip only counts when it is inside (or just around) the piano strip.
+  function inZone(y) {
+    const H = canvas.height;
+    return y >= kb.top - 0.025 * H && y <= kb.top + kb.h + 0.035 * H;
+  }
+
+  // ---------- Finger tracking ----------
+  const TIPS = [4, 8, 12, 16, 20];
+  const fingers = {};
+  const mouseState = { voice: null, midi: null };
+  let hoverMidis = new Set();
+  const downMidis = new Map();
+
+  const markDown = m => downMidis.set(m, (downMidis.get(m) || 0) + 1);
+  const markUp = m => { const c = (downMidis.get(m) || 0) - 1; if (c <= 0) downMidis.delete(m); else downMidis.set(m, c); };
+  function releaseFinger(st) {
+    if (st && st.down) { noteOff(st.voice); markUp(st.midi); st.down = false; st.voice = null; }
+  }
+  function releaseAll() {
+    Object.values(fingers).forEach(releaseFinger);
+    if (mouseState.voice) { noteOff(mouseState.voice); markUp(mouseState.midi); mouseState.voice = null; }
+  }
+  // ---------- Accurate tap detection ----------
+  // Sensitivity is expressed as a fraction of a white-key width/height,
+  // so it remains consistent when the browser window changes size.
+  // 1 = deliberate tap, 10 = very light tap.
+  function tapThresholdPx() {
+    const level = parseInt(sensEl.value, 10);
+    const base = Math.max(7, kb.h * 0.055);
+    return base + (10 - level) * Math.max(1.2, kb.h * 0.018);
+  }
+
+  function processFinger(id, px, py, relY, now) {
+    const st = fingers[id] || (fingers[id] = {
+      hist: [],
+      down: false,
+      voice: null,
+      midi: null,
+      lastTrig: 0,
+      peak: 0,
+      t0: 0,
+      armed: true,
+      touch: false
+    });
+
+    // relY is fingertip Y relative to the palm. A real finger tap produces
+    // a downward spike even when the entire hand moves up/down.
+    st.hist.push({ t: now, y: relY });
+    while (st.hist.length && now - st.hist[0].t > 170) st.hist.shift();
+
+    const zone = inZone(py);
+    const key = zone ? keyAt(px, py) : null;
+    if (key) hoverMidis.add(key.midi);
+
+    const threshold = tapThresholdPx();
+
+    // Find the recent relative movement from the oldest point in the
+    // short history to the current fingertip position.
+    const old = st.hist[0];
+    const delta = old ? relY - old.y : 0;
+
+    // Downward velocity helps reject slow hand drift.
+    let velocity = 0;
+    if (st.hist.length >= 2) {
+      const prev = st.hist[st.hist.length - 2];
+      const dt = Math.max(8, now - prev.t);
+      velocity = (relY - prev.y) / dt; // px/ms
+    }
+
+    // Touch mode: the fingertip entering the lower part of a key plays it.
+    // Tap mode: require BOTH enough relative displacement and a downward
+    // velocity spike. This makes accidental hand motion much less likely.
+    const enterY = kb.top + kb.h * 0.78;
+    const exitY = kb.top + kb.h + 0.035 * canvas.height;
+
+    if (!zone || py > exitY) st.armed = true;
+
+    if (!st.down && key && st.armed) {
+      const touchTrigger = touchEl.checked && py <= enterY;
+      const tapTrigger =
+        delta > threshold &&
+        velocity > Math.max(0.12, threshold / 55);
+
+      if ((touchTrigger || tapTrigger) && now - st.lastTrig > 125) {
+        const velocityAmount = Math.max(
+          0.45,
+          Math.min(1, 0.45 + Math.abs(velocity) * 1.8)
+        );
+
+        st.voice = noteOn(key.midi, touchTrigger ? 0.8 : velocityAmount);
+        st.midi = key.midi;
+        st.down = true;
+        st.touch = touchTrigger;
+        st.peak = relY;
+        st.t0 = now;
+        st.lastTrig = now;
+        st.armed = false;
+        markDown(key.midi);
+      }
+    } else if (st.down) {
+      st.peak = Math.max(st.peak, relY);
+
+      // Tap notes release when the finger comes back up.
+      // Touch notes release when the finger leaves the key.
+      const lifted = !st.touch && (st.peak - relY) > threshold * 0.45;
+      const left = !zone || (st.touch && py > exitY);
+
+      if (lifted || left || now - st.t0 > 1200) releaseFinger(st);
+    }
+  }
+
+  // ---------- Drawing ----------
+  const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  function drawKeys() {
+    // Piano body behind the keys.
+    ctx.save();
+    ctx.fillStyle = 'rgba(10,8,14,0.78)';
+    ctx.shadowColor = 'rgba(0,0,0,0.55)';
+    ctx.shadowBlur = 20;
+    ctx.shadowOffsetY = 7;
+    roundRectPath(0, kb.top - 5, canvas.width, kb.h + 10, 8);
+    ctx.fill();
+    ctx.restore();
+
+    // 52 white keys.
+    for (const k of whites) {
+      const down = downMidis.has(k.midi);
+      const hov = hoverMidis.has(k.midi);
+      const x = k.x + 0.7;
+      const y = k.y;
+      const w = Math.max(2, k.w - 1.4);
+      const h = k.h;
+
+      roundRectPath(x, y, w, h, Math.min(5, w * 0.14));
+
+      const g = ctx.createLinearGradient(0, y, 0, y + h);
+      if (down) {
+        g.addColorStop(0, 'rgba(255,105,175,1)');
+        g.addColorStop(0.45, 'rgba(246,62,142,0.98)');
+        g.addColorStop(1, 'rgba(182,27,95,0.96)');
+      } else if (hov) {
+        g.addColorStop(0, 'rgba(255,255,255,1)');
+        g.addColorStop(0.55, 'rgba(239,234,242,0.98)');
+        g.addColorStop(1, 'rgba(198,191,207,0.95)');
+      } else {
+        g.addColorStop(0, 'rgba(255,255,255,0.98)');
+        g.addColorStop(0.5, 'rgba(246,244,248,0.97)');
+        g.addColorStop(1, 'rgba(204,199,210,0.94)');
+      }
+      ctx.fillStyle = g;
+      ctx.fill();
+
+      ctx.strokeStyle = 'rgba(25,20,32,0.52)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      // Subtle ivory highlight.
+      ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+      ctx.beginPath();
+      ctx.moveTo(x + 2, y + 2);
+      ctx.lineTo(x + w - 2, y + 2);
+      ctx.stroke();
+    }
+
+    // 36 black keys. They overlap the white keys exactly as on a piano.
+    for (const k of blacks) {
+      const down = downMidis.has(k.midi);
+      const hov = hoverMidis.has(k.midi);
+      const x = k.x;
+      const y = k.y;
+      const w = k.w;
+      const h = k.h;
+
+      ctx.save();
+      ctx.shadowColor = 'rgba(0,0,0,0.72)';
+      ctx.shadowBlur = 6;
+      ctx.shadowOffsetY = 4;
+
+      roundRectPath(x, y, w, h, Math.min(4, w * 0.16));
+
+      const g = ctx.createLinearGradient(0, y, 0, y + h);
+      if (down) {
+        g.addColorStop(0, '#ff8cbe');
+        g.addColorStop(0.3, '#ed3f8e');
+        g.addColorStop(1, '#8f1d56');
+      } else if (hov) {
+        g.addColorStop(0, '#696070');
+        g.addColorStop(0.25, '#39323f');
+        g.addColorStop(1, '#110e16');
+      } else {
+        g.addColorStop(0, '#57505d');
+        g.addColorStop(0.18, '#29232f');
+        g.addColorStop(1, '#09070c');
+      }
+      ctx.fillStyle = g;
+      ctx.fill();
+
+      ctx.shadowColor = 'transparent';
+      ctx.strokeStyle = 'rgba(255,255,255,0.20)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      // Black-key top highlight.
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.beginPath();
+      ctx.moveTo(x + 2.5, y + 2.5);
+      ctx.lineTo(x + w - 2.5, y + 2.5);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    // Labels: all 52 white keys, but tiny enough to remain readable.
+    if (showLabelsEl.checked) {
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = `${Math.max(8, Math.round(kb.ww * 0.30))}px system-ui, sans-serif`;
+
+      for (const k of whites) {
+        const important = k.name === 'A0' || k.name === 'C8' || k.name.startsWith('C');
+        if (!important && kb.ww < 20) continue;
+
+        ctx.fillStyle = downMidis.has(k.midi)
+          ? '#ffffff'
+          : 'rgba(25,20,32,0.70)';
+
+        ctx.fillText(
+          k.name,
+          k.x + k.w / 2,
+          k.y + k.h * 0.86
+        );
+      }
+    }
+
+    // Outer piano frame.
+    ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(0.75, kb.top - 4.25, canvas.width - 1.5, kb.h + 8.5);
+  }
+
+
+  // map normalized video landmarks to canvas pixels (mirrored, cover-fit)
+  function mapPt(l) {
+    const W = canvas.width, H = canvas.height, vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+    const sc = Math.max(W / vw, H / vh);
+    const ox = (W - vw * sc) / 2, oy = (H - vh * sc) / 2;
+    return [W - (ox + l.x * vw * sc), oy + l.y * vh * sc];
+  }
+
+  function drawHand(lms) {
+    const pt = i => mapPt(lms[i]);
+    ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.strokeStyle = '#4de1d0';
+    ctx.beginPath();
+    for (const [a, b] of CONNECTIONS) { const p = pt(a), q = pt(b); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); }
+    ctx.stroke();
+    for (let i = 0; i < 21; i++) {
+      const [x, y] = pt(i), tip = TIPS.includes(i);
+      ctx.beginPath(); ctx.arc(x, y, tip ? 8 : 4, 0, Math.PI * 2);
+      ctx.fillStyle = tip ? '#ff4f9a' : '#fff'; ctx.fill();
+    }
+  }
+
+  function onResults(res) {
+    if (!camOn) return;
+    const now = performance.now(), W = canvas.width, H = canvas.height;
+    const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+    const sc = Math.max(W / vw, H / vh);
+    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1);
+    ctx.drawImage(res.image, (W - vw * sc) / 2, (H - vh * sc) / 2, vw * sc, vh * sc);
+    ctx.restore();
+
+    hoverMidis = new Set();
+    const seen = new Set();
+    const hands = res.multiHandLandmarks || [];
+    hands.forEach((lms, h) => {
+      const palmY = mapPt(lms[9])[1];
+      for (const t of TIPS) {
+        const id = h + '-' + t;
+        seen.add(id);
+        const [px, py] = mapPt(lms[t]);
+        processFinger(id, px, py, py - 0.4 * palmY, now);
+      }
+    });
+    for (const id in fingers) if (!seen.has(id)) releaseFinger(fingers[id]);
+
+    drawKeys();
+    if (showHandEl.checked) hands.forEach(drawHand);
+  }
+
+  function drawIdle() {
+    ctx.fillStyle = '#0d0a12'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    hoverMidis = new Set();
+    drawKeys();
+  }
+
+  // ---------- Mouse / touch (letterbox-aware) ----------
+  function canvasPoint(e) {
+    const r = canvas.getBoundingClientRect();
+    return [(e.clientX - r.left) * canvas.width / r.width, (e.clientY - r.top) * canvas.height / r.height];
+  }
+  canvas.addEventListener('pointerdown', e => {
+    if (!audio) return;
+    const [x, y] = canvasPoint(e);
+    if (!inZone(y)) return;
+    const k = keyAt(x, y);
+    mouseState.voice = noteOn(k.midi, 0.8); mouseState.midi = k.midi; markDown(k.midi);
+    if (!camOn) drawIdle();
+    canvas.setPointerCapture(e.pointerId);
+  });
+  const mouseUp = () => {
+    if (mouseState.voice) { noteOff(mouseState.voice); markUp(mouseState.midi); mouseState.voice = null; if (!camOn) drawIdle(); }
+  };
+  canvas.addEventListener('pointerup', mouseUp);
+  canvas.addEventListener('pointercancel', mouseUp);
+
+  // ---------- Camera on/off ----------
+  let hands = null, cam = null, camOn = false, busy = false;
+
+  function resizeCanvas(w, h) { canvas.width = w; canvas.height = h; layoutKeys(); }
+
+  function setBtn() {
+    camBtn.innerHTML = camOn ? '<span class="dot"></span>Camera on' : '<span class="dot"></span>' + (dock.classList.contains('center') ? 'Start camera' : 'Camera off');
+    camBtn.classList.toggle('off', !camOn);
+  }
+
+  async function startCamera() {
+    if (busy) return;
+    busy = true; camBtn.disabled = true; errEl.textContent = '';
+    camBtn.textContent = 'Loading…';
+    try {
+      initAudio(); await audio.resume();
+      if (typeof Hands === 'undefined' || typeof Camera === 'undefined')
+        throw new Error('Could not load the hand-tracking library. Check your internet connection and reload.');
+      if (!hands) {
+        hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+        hands.onResults(onResults);
+      }
+      cam = new Camera(video, { onFrame: async () => { if (camOn) await hands.send({ image: video }); }, width: 1280, height: 720 });
+      camOn = true;
+      await cam.start();
+      dock.classList.remove('center'); dock.classList.add('corner');
+    } catch (err) {
+      console.error(err);
+      camOn = false;
+      errEl.textContent = (err && err.name === 'NotAllowedError')
+        ? 'Camera access was blocked. Allow the camera for this page and try again.'
+        : (err && err.message) || 'Could not start the camera.';
+    }
+    busy = false; camBtn.disabled = false; setBtn();
+  }
+
+  async function stopCamera() {
+    camOn = false;
+    releaseAll();
+    try { if (cam) await cam.stop(); } catch (e) {}
+    if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
+    drawIdle(); setBtn();
+  }
+
+  camBtn.addEventListener('click', () => { camOn ? stopCamera() : startCamera(); });
+  gearBtn.addEventListener('click', () => panel.classList.toggle('open'));
+  window.addEventListener('blur', releaseAll);
+
+  function fitWindow() { resizeCanvas(window.innerWidth, window.innerHeight); if (!camOn) drawIdle(); }
+  window.addEventListener('resize', fitWindow);
+  fitWindow(); setBtn();
+})();
+</script>
+</body>
+</html>
