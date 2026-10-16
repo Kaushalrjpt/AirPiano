@@ -63,7 +63,7 @@
 </div>
 <div id="panel">
   <label>Volume <input id="vol" type="range" min="0" max="1" step="0.01" value="0.7"></label>
-  <label>Tap sensitivity <input id="sens" type="range" min="1" max="10" step="1" value="6"></label>
+  <label>Tap sensitivity <input id="sens" type="range" min="1" max="10" step="1" value="8"></label>
   <label>Keyboard <span style="opacity:.65">88 keys · A0–C8</span></label>
   <label>Touch to play <input id="touchMode" type="checkbox" checked></label>
   <label>Hand lines <input id="showHand" type="checkbox" checked></label>
@@ -95,7 +95,7 @@
   let audio = null, master = null;
   function initAudio() {
     if (audio) return;
-    audio = new (window.AudioContext || window.webkitAudioContext)();
+    audio = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
     const comp = audio.createDynamicsCompressor();
     master = audio.createGain();
     master.gain.value = parseFloat(volEl.value);
@@ -114,14 +114,15 @@
     out.gain.exponentialRampToValueAtTime(Math.max(0.03, velocity) * 0.35, t + 0.35);
     out.gain.exponentialRampToValueAtTime(0.0001, t + 3.5);
     out.connect(master);
+    const oscs = [];
     [[1, 'triangle', 1.0], [2, 'sine', 0.45], [3, 'sine', 0.2], [4, 'sine', 0.1]].forEach(([mult, type, amp], i) => {
       const o = audio.createOscillator(), g = audio.createGain();
       o.type = type; o.frequency.value = f * mult; o.detune.value = (Math.random() - 0.5) * 4;
       g.gain.setValueAtTime(amp, t);
       g.gain.exponentialRampToValueAtTime(0.0001, t + (i === 0 ? 3.5 : 1.2 / mult + 0.4));
-      o.connect(g); g.connect(out); o.start(t); o.stop(t + 3.6);
+      oscs.push(o); o.connect(g); g.connect(out); o.start(t); o.stop(t + 3.6);
     });
-    return { out };
+    return { out, oscs };
   }
   function noteOff(v) {
     if (!v || !audio) return;
@@ -129,6 +130,7 @@
     v.out.gain.cancelScheduledValues(t);
     v.out.gain.setValueAtTime(Math.max(v.out.gain.value, 0.0001), t);
     v.out.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+    v.oscs.forEach(o => { try { o.stop(t + 0.4); } catch (e) {} });
   }
 
   // ---------- Full 88-key piano layout ----------
@@ -218,93 +220,95 @@
     Object.values(fingers).forEach(releaseFinger);
     if (mouseState.voice) { noteOff(mouseState.voice); markUp(mouseState.midi); mouseState.voice = null; }
   }
-  // ---------- Accurate tap detection ----------
-  // Sensitivity is expressed as a fraction of a white-key width/height,
-  // so it remains consistent when the browser window changes size.
-  // 1 = deliberate tap, 10 = very light tap.
+  // ---------- Accurate, low-latency finger logic ----------
+  const GRACE = 90; // ms a briefly-lost fingertip is kept before its note is released
+  const isB = k => k.h < kb.h;
   function tapThresholdPx() {
     const level = parseInt(sensEl.value, 10);
-    const base = Math.max(7, kb.h * 0.055);
-    return base + (10 - level) * Math.max(1.2, kb.h * 0.018);
+    return Math.max(5, kb.h * 0.04) + (10 - level) * Math.max(1, kb.h * 0.013);
+  }
+  // Key under a fingertip. Black keys only count when the tip is clearly in the black zone,
+  // and the previous key is kept until the tip is well past its edge (hysteresis),
+  // so jitter can never flip the note to the neighbouring key.
+  function resolveKey(x, y, prev) {
+    let raw = keyAt(x, y);
+    const bb = kb.top + kb.h * 0.62, m = kb.ww * 0.22;
+    if (raw && isB(raw) && y > bb - kb.h * 0.04) raw = whites[Math.min(WHITE_COUNT - 1, Math.max(0, Math.floor(x / kb.ww)))];
+    if (raw && prev && raw !== prev) {
+      const inX = x >= prev.x - m && x <= prev.x + prev.w + m;
+      if (isB(prev) ? (inX && y < bb + kb.h * 0.06) : (inX && !isB(raw))) return prev;
+    }
+    return raw;
   }
 
-  function processFinger(id, px, py, relY, now) {
-    const st = fingers[id] || (fingers[id] = {
-      hist: [],
-      down: false,
-      voice: null,
-      midi: null,
-      lastTrig: 0,
-      peak: 0,
-      t0: 0,
-      armed: true,
-      touch: false
-    });
-
-    // relY is fingertip Y relative to the palm. A real finger tap produces
-    // a downward spike even when the entire hand moves up/down.
-    st.hist.push({ t: now, y: relY });
-    while (st.hist.length && now - st.hist[0].t > 170) st.hist.shift();
-
-    const zone = inZone(py);
-    const key = zone ? keyAt(px, py) : null;
-    if (key) hoverMidis.add(key.midi);
-
-    const threshold = tapThresholdPx();
-
-    // Find the recent relative movement from the oldest point in the
-    // short history to the current fingertip position.
-    const old = st.hist[0];
-    const delta = old ? relY - old.y : 0;
-
-    // Downward velocity helps reject slow hand drift.
-    let velocity = 0;
-    if (st.hist.length >= 2) {
-      const prev = st.hist[st.hist.length - 2];
-      const dt = Math.max(8, now - prev.t);
-      velocity = (relY - prev.y) / dt; // px/ms
+  // Glissando: sliding a pressed finger across keys plays every key it passes over,
+  // including keys skipped between two camera frames (path is sampled every half key).
+  function glide(st, x0, x1, y, now) {
+    const seq = [], n = Math.max(1, Math.ceil(Math.abs(x1 - x0) / (kb.ww * 0.5)));
+    for (let i = 1; i <= n; i++) {
+      const k = resolveKey(x0 + (x1 - x0) * i / n, y, null);
+      if (k && k.midi !== st.midi && !seq.includes(k) ) seq.push(k);
     }
+    if (!seq.length) return;
+    noteOff(st.voice); markUp(st.midi);
+    seq.forEach((k, i) => {
+      const v = noteOn(k.midi, 0.7); markDown(k.midi);
+      if (i < seq.length - 1) setTimeout(() => { noteOff(v); markUp(k.midi); }, 110);
+      else { st.voice = v; st.midi = k.midi; st.t0 = now; }
+    });
+  }
 
-    // Touch mode: the fingertip entering the lower part of a key plays it.
-    // Tap mode: require BOTH enough relative displacement and a downward
-    // velocity spike. This makes accidental hand motion much less likely.
-    const enterY = kb.top + kb.h * 0.78;
-    const exitY = kb.top + kb.h + 0.035 * canvas.height;
+  function processFinger(id, rx, ry, relY, now) {
+    const st = fingers[id] || (fingers[id] = { hist: [], down: false, voice: null, midi: null, lastTrig: 0,
+      peak: 0, t0: 0, armed: true, touch: false, sx: rx, sy: ry, key: null, pend: 0, seen: now, pyPrev: ry, tPrev: now });
+    st.seen = now;
+    // Adaptive smoothing: steady when still (no jitter), instant when moving fast (no lag).
+    const d = Math.abs(rx - st.sx) + Math.abs(ry - st.sy);
+    const a = Math.min(1, 0.5 + d / (kb.ww * 1.5));
+    st.sx += (rx - st.sx) * a; st.sy += (ry - st.sy) * a;
+    const px = st.sx, py = st.sy;
+    const up = (st.pyPrev - py) / Math.max(8, now - st.tPrev); // upward px/ms
+    st.pyPrev = py; st.tPrev = now;
+    const gx0 = st.gx === undefined ? px : st.gx; st.gx = gx0;
 
-    if (!zone || py > exitY) st.armed = true;
+    st.hist.push({ t: now, y: relY, key: st.key });
+    while (st.hist.length && now - st.hist[0].t > 170) st.hist.shift();
+    const zone = inZone(py);
+    st.key = zone ? resolveKey(px, py, st.key) : null;
+    if (st.key) hoverMidis.add(st.key.midi);
 
-    if (!st.down && key && st.armed) {
-      const touchTrigger = touchEl.checked && py <= enterY;
-      const tapTrigger =
-        delta > threshold &&
-        velocity > Math.max(0.12, threshold / 55);
+    const thr = tapThresholdPx(), old = st.hist[0];
+    const delta = old ? relY - old.y : 0;
+    let vy = 0;
+    if (st.hist.length >= 2) { const p = st.hist[st.hist.length - 2]; vy = (relY - p.y) / Math.max(8, now - p.t); }
 
-      if ((touchTrigger || tapTrigger) && now - st.lastTrig > 125) {
-        const velocityAmount = Math.max(
-          0.45,
-          Math.min(1, 0.45 + Math.abs(velocity) * 1.8)
-        );
+    const pressY = kb.top + kb.h * 0.9;   // touch-press line
+    const rearmY = kb.top + kb.h;          // finger must drop below this to re-arm
+    if (!zone || py > rearmY) { st.armed = true; st.pend = 0; }
 
-        st.voice = noteOn(key.midi, touchTrigger ? 0.8 : velocityAmount);
-        st.midi = key.midi;
-        st.down = true;
-        st.touch = touchTrigger;
-        st.peak = relY;
-        st.t0 = now;
-        st.lastTrig = now;
-        st.armed = false;
+    if (!st.down && st.key && st.armed && now - st.lastTrig > 40) {
+      let key = st.key, touchTrig = touchEl.checked && py <= pressY;
+      // Under a black key's x-range while still rising: wait up to 70ms to see if it is a black-key press.
+      if (touchTrig && !isB(key) && blacks.some(b => px >= b.x && px <= b.x + b.w)) {
+        st.pend = st.pend || now;
+        if (up > 0.05 && now - st.pend < 70) touchTrig = false;
+      }
+      const tapTrig = delta > thr && vy > Math.max(0.08, thr / 70);
+      if (touchTrig || tapTrig) {
+        if (!touchTrig && old && old.key) key = old.key; // tap: use the key the finger was hovering on BEFORE the tap
+        st.voice = noteOn(key.midi, touchTrig ? 0.8 : Math.max(0.45, Math.min(1, 0.45 + Math.abs(vy) * 1.8)));
+        st.midi = key.midi; st.down = true; st.touch = touchTrig;
+        st.peak = relY; st.t0 = now; st.lastTrig = now; st.armed = false; st.pend = 0;
         markDown(key.midi);
       }
     } else if (st.down) {
+      if (st.touch && zone && py <= rearmY && st.key && st.key.midi !== st.midi) glide(st, st.gx, px, py, now);
       st.peak = Math.max(st.peak, relY);
-
-      // Tap notes release when the finger comes back up.
-      // Touch notes release when the finger leaves the key.
-      const lifted = !st.touch && (st.peak - relY) > threshold * 0.45;
-      const left = !zone || (st.touch && py > exitY);
-
-      if (lifted || left || now - st.t0 > 1200) releaseFinger(st);
+      const lifted = !st.touch && (st.peak - relY) > thr * 0.45;
+      const left = !zone || (st.touch && py > rearmY);
+      if (lifted || left || now - st.t0 > 2500) releaseFinger(st);
     }
+    st.gx = px;
   }
 
   // ---------- Drawing ----------
@@ -487,16 +491,20 @@
     hoverMidis = new Set();
     const seen = new Set();
     const hands = res.multiHandLandmarks || [];
+    const labels = res.multiHandedness || [], used = {};
     hands.forEach((lms, h) => {
+      // stable finger IDs from Left/Right label (array order can swap between frames)
+      let lab = (labels[h] && labels[h].label) || 'H';
+      if (used[lab]) lab += h; used[lab] = 1;
       const palmY = mapPt(lms[9])[1];
       for (const t of TIPS) {
-        const id = h + '-' + t;
+        const id = lab + '-' + t;
         seen.add(id);
         const [px, py] = mapPt(lms[t]);
         processFinger(id, px, py, py - 0.4 * palmY, now);
       }
     });
-    for (const id in fingers) if (!seen.has(id)) releaseFinger(fingers[id]);
+    for (const id in fingers) if (!seen.has(id) && now - fingers[id].seen > GRACE) { releaseFinger(fingers[id]); delete fingers[id]; }
 
     drawKeys();
     if (showHandEl.checked) hands.forEach(drawHand);
@@ -551,7 +559,7 @@
         hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
         hands.onResults(onResults);
       }
-      cam = new Camera(video, { onFrame: async () => { if (camOn) await hands.send({ image: video }); }, width: 1280, height: 720 });
+      cam = new Camera(video, { onFrame: async () => { if (camOn) await hands.send({ image: video }); }, width: 960, height: 540 });
       camOn = true;
       await cam.start();
       dock.classList.remove('center'); dock.classList.add('corner');
