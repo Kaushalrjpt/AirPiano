@@ -117,5 +117,5 @@ _Edit this list to match your actual plans._
 
 ## 👤 Author
 
-**Your Name**
-[Kaushal Pratap Rajput](https://www.linkedin.com/in/kaushal-pratap-rajput-4216b1329/) · [Kaushalrjpt](https://github.com/Kaushalrjpt)
+**Kaushal Pratap Rajput**
+[LinkedInt](https://www.linkedin.com/in/kaushal-pratap-rajput-4216b1329/) · [Githubt](https://github.com/Kaushalrjpt)
