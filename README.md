@@ -114,11 +114,8 @@ _Edit this list to match your actual plans._
 
 - [MediaPipe Hands](https://developers.google.com/mediapipe) by Google for hand landmark detection.
 
-## 📄 License
-
-_Add a license (for example MIT) before publishing._
 
 ## 👤 Author
 
 **Your Name**
-[LinkedIn](https://linkedin.com/in/your-profile) · [GitHub](https://github.com/your-username)
+[Kaushal Pratap Rajput](https://www.linkedin.com/in/kaushal-pratap-rajput-4216b1329/) · [Kaushalrjpt](https://github.com/Kaushalrjpt)
