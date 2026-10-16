@@ -118,4 +118,4 @@ _Edit this list to match your actual plans._
 ## 👤 Author
 
 **Kaushal Pratap Rajput**
-[LinkedInt](https://www.linkedin.com/in/kaushal-pratap-rajput-4216b1329/) · [Githubt](https://github.com/Kaushalrjpt)
+[LinkedIn](https://www.linkedin.com/in/kaushal-pratap-rajput-4216b1329/) · [Github](https://github.com/Kaushalrjpt)
