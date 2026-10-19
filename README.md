@@ -4,11 +4,7 @@ Play a full 88-key piano in mid-air using only your webcam and your hands.
 
 Air Piano is a single HTML file. It uses real-time hand tracking to follow your fingertips and the Web Audio API to synthesize piano-like sound. Everything runs in the browser, with no backend, no build step and no installation.
 
-> **Demo video:** _add your LinkedIn / YouTube link here_
-
-![Air Piano screenshot](docs/screenshot.png)
-<!-- Replace with a screenshot of the keyboard with the hand overlay visible -->
-
+> **Demo video:** [_add your LinkedIn / YouTube link here_](https://lnkd.in/p/gFtwbP_X)
 ---
 
 ## ✨ Features
